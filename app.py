@@ -235,7 +235,7 @@ def generate_image_hf(prompt, negative_prompt, width, height, steps, seed, model
         if active_token:
             headers["Authorization"] = f"Bearer {active_token}"
             
-        url = f"https://api-inference.huggingface.co/models/{model}"
+        url = f"https://router.huggingface.co/hf-inference/{model}"
         payload = {
             "inputs": prompt,
             "parameters": {
