@@ -1,7 +1,7 @@
 # 🌌 COSMOS v3 - Super Text2Image Web App
 
 一個基於 Python Streamlit 打造的**極致視覺・超級圖像產生器**。本專案將原本的 React 設計完整移植至 Streamlit，保留了精美的深色霓虹科技美學，並集成了強大的多引擎生圖與智慧優化管線。
-
+🚀 Live Demo: https://prompt-image-generator.streamlit.app/
 ## ✨ 特色功能
 
 1. **🚀 多節點生圖引擎（三層自動備援）**：
