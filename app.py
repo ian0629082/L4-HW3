@@ -235,7 +235,7 @@ def generate_image_hf(prompt, negative_prompt, width, height, steps, seed, model
         if active_token:
             headers["Authorization"] = f"Bearer {active_token}"
             
-        url = f"https://router.huggingface.co/hf-inference/{model}"
+        url = f"https://router.huggingface.co/hf-inference/models/{model}"
         payload = {
             "inputs": prompt,
             "parameters": {
@@ -255,6 +255,8 @@ def generate_image_hf(prompt, negative_prompt, width, height, steps, seed, model
                 continue
             if response.status_code == 200:
                 return response.content, model.split("/")[-1]
+            else:
+                print(f"HF Attempt {attempt} failed with status {response.status_code}: {response.text}")
         except Exception as e:
             print(f"HF Attempt {attempt} failed: {e}")
             

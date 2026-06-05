@@ -273,7 +273,7 @@ export default function App() {
         }
       };
 
-      const hfResponse = await fetch(`https://router.huggingface.co/hf-inference/${activeModel}`, {
+      const hfResponse = await fetch(`https://router.huggingface.co/hf-inference/models/${activeModel}`, {
         method: "POST",
         headers: headers,
         body: JSON.stringify(payload)
@@ -309,7 +309,7 @@ export default function App() {
           }
         };
 
-        const fluxResponse = await fetch(`https://router.huggingface.co/hf-inference/black-forest-labs/FLUX.1-schnell`, {
+        const fluxResponse = await fetch(`https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell`, {
           method: "POST",
           headers: headers,
           body: JSON.stringify(payload)
