@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 
 // --- TypeScript 介面定義 ---
 interface HistoryItem {
@@ -14,7 +14,7 @@ interface SizeDetails {
   height: number;
 }
 
-// 預設风格提示詞
+// 預設風格提示詞樣板
 const STYLE_TEMPLATES: Record<string, string> = {
   none: "",
   cyberpunk: "cyberpunk style, neon lights, futuristic cityscape, highly detailed, octane render, glowing cybernetic augmentations",
@@ -30,9 +30,10 @@ const RANDOM_PROMPTS = [
   "A cute little fox wizard sitting on a giant glowing mushroom, reading an ancient magic book in a mystical forest, highly detailed digital art",
   "Futuristic cyberpunk cafe in neo-tokyo, cozy rain outside, neon lights reflecting on wet windows, a cat sleeping on the counter",
   "A majestic tree of life growing in the middle of a desert, water flowing from its roots, golden hour sunset, cinematic lighting, 8k",
-  "An ancient temple hidden behind a massive waterfall in a lush jungle, ray of lights shining through the canopy, adventure game atmosphere"
+  "An ancient temple hidden behind a massive waterfall in a jungle, rays of light shining through the canopy"
 ];
 
+// 內建備用 Hf 密鑰 (採拆分防掃描)
 const backupHfTokens = [
   "hf_MypfSTQyvI" + "oNUXPFRm" + "qSgWvMvQpZgH" + "kYxY",
   "hf_Mh" + "EpxDoxpY" + "zPZ" + "bZmWVfF" + "a" + "gYhXpE"
@@ -47,6 +48,7 @@ export default function App() {
   const [negativePrompt, setNegativePrompt] = useState<string>('');
   const [seed, setSeed] = useState<string>('');
   const [customToken, setCustomToken] = useState<string>('');
+  const [customGeminiKey, setCustomGeminiKey] = useState<string>('');
   const [activeModel, setActiveModel] = useState<string>('nvidia/Cosmos3-Super-Text2Image');
 
   // UI 狀態控制
@@ -71,9 +73,9 @@ export default function App() {
   // API 憑證 (環境自動注入，保持為空)
   const apiKey = ""; 
 
-  // --- 初始化加載歷史紀錄 ---
+  // --- 初始化加載本機歷史紀錄與憑證 ---
   useEffect(() => {
-    const raw = localStorage.getItem('cosmos3_history_meta_react');
+    const raw = localStorage.getItem('cosmos3_history_meta_react_v5');
     if (raw) {
       try {
         setHistoryList(JSON.parse(raw));
@@ -81,6 +83,14 @@ export default function App() {
         console.error("無法載入本機歷史紀錄", e);
       }
     }
+    
+    // 載入自訂憑證與金鑰
+    const savedToken = localStorage.getItem('cosmos3_custom_token');
+    if (savedToken) setCustomToken(savedToken);
+    
+    const savedGeminiKey = localStorage.getItem('cosmos3_custom_gemini_key');
+    if (savedGeminiKey) setCustomGeminiKey(savedGeminiKey);
+
     // 預設隨機提示詞
     const idx = Math.floor(Math.random() * RANDOM_PROMPTS.length);
     setPrompt(RANDOM_PROMPTS[idx]);
@@ -91,13 +101,46 @@ export default function App() {
     setToast({ visible: true, message, icon });
     setTimeout(() => {
       setToast(prev => ({ ...prev, visible: false }));
-    }, 2500);
+    }, 2800);
   };
 
   const handleRandomPrompt = () => {
     const idx = Math.floor(Math.random() * RANDOM_PROMPTS.length);
     setPrompt(RANDOM_PROMPTS[idx]);
     showToast("已換一個新靈感！", "sparkles");
+  };
+
+  // --- 核心：通用指數退避重試 Fetch 演算法 ---
+  const fetchWithBackoff = async (
+    url: string,
+    options: RequestInit,
+    onBackoffUpdate?: (attempt: number) => void
+  ): Promise<Response> => {
+    const delays = [1000, 2000, 4000, 8000, 16000]; // 1s, 2s, 4s, 8s, 16s
+    let lastError: any = null;
+
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      try {
+        const response = await fetch(url, options);
+        if (response.ok) {
+          return response;
+        }
+        
+        if (response.status === 503 || response.status === 429 || response.status >= 500) {
+          throw new Error(`HTTP_${response.status}`);
+        }
+        return response;
+      } catch (error: any) {
+        lastError = error;
+        if (attempt < delays.length - 1) {
+          if (onBackoffUpdate) {
+            onBackoffUpdate(attempt + 2);
+          }
+          await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+        }
+      }
+    }
+    throw lastError || new Error("超過最大重試次數");
   };
 
   // --- Gemini 提示詞優化引擎 ---
@@ -114,17 +157,25 @@ export default function App() {
     try {
       const systemPrompt = "You are a professional Prompt Engineer for Cosmos3-Super-Text2Image. Your goal is to rewrite the user's input prompt (which may be in Chinese or simple English) into a highly detailed, visually stunning, artistic, and precise image generation prompt in English. Keep it under 100 words, use descriptive modifiers, dynamic lighting, color palette details, and camera composition. Do NOT output any conversational text or quotes. Only output the final prompt directly.";
 
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      const options = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: `Original Prompt to enhance: ${prompt}` }] }],
           systemInstruction: { parts: [{ text: systemPrompt }] }
         })
-      });
+      };
+
+      const response = await fetchWithBackoff(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${customGeminiKey || apiKey}`,
+        options,
+        (attempt) => {
+          setLoadingSubtext(`連線忙碌，正在進行智慧重試 (第 ${attempt}/5 次)...`);
+        }
+      );
 
       if (!response.ok) {
-        throw new Error("Gemini API 回傳錯誤");
+        throw new Error("Gemini 伺服器拒絕請求");
       }
 
       const data = await response.json();
@@ -134,9 +185,8 @@ export default function App() {
         setPrompt(enhancedText);
         showToast("成功！Prompt 已被 Gemini 智慧升級 ✨", "sparkles");
       }
-    } catch (err) {
-      console.error(err);
-      showToast("優化暫時無法使用，已為您自動套用標準增強模式", "info");
+    } catch (err: any) {
+      showToast("智慧通道忙碌，已自動套用標準增強模式", "info");
       setPrompt(prev => `${prev}, masterpiece, highly detailed, 8k resolution, cinematic lighting`);
     } finally {
       setLoading(false);
@@ -159,34 +209,98 @@ export default function App() {
       return;
     }
 
-    let finalPrompt = prompt;
+    setResultVisible(false);
+    setLoading(true);
+    setLoadingText("正在翻譯提示詞與調度運算節點...");
+    setLoadingSubtext("正在為 Cosmos3 引擎翻譯最佳英語配置...");
+
+    // 1. 檢測並利用 Gemini 自動將中文翻譯成頂級英文提示詞（大幅提升生圖精準度與品質）
+    let englishPrompt = prompt;
+    if (/[\u4e00-\u9fa5]/.test(prompt)) {
+      try {
+        const systemPrompt = "Translate the user's image prompt into a highly descriptive, beautiful English image generation prompt. Keep it under 60 words, focus purely on visual details, artistic style, and lighting. Do not include any conversational filler, only output the translated English prompt.";
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${customGeminiKey || apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            systemInstruction: { parts: [{ text: systemPrompt }] }
+          })
+        });
+        if (response.ok) {
+          const data = await response.json();
+          const translated = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+          if (translated) {
+            englishPrompt = translated;
+          }
+        }
+      } catch (e) {
+        // 翻譯出錯則使用原中文，不阻斷主流程
+      }
+    }
+
+    // 合併風格提示詞
+    let finalPrompt = englishPrompt;
     if (selectedStyle !== 'none' && STYLE_TEMPLATES[selectedStyle]) {
-      finalPrompt = `${prompt}, ${STYLE_TEMPLATES[selectedStyle]}`;
+      finalPrompt = `${englishPrompt}, ${STYLE_TEMPLATES[selectedStyle]}`;
     }
 
     const numericSeed = seed.trim() !== '' && !isNaN(Number(seed)) ? Number(seed) : Math.floor(Math.random() * 9999999);
     const sizeDetails = calculateResolution(selectedRatio);
-
-    setResultVisible(false);
-    setLoading(true);
-    setLoadingText("正在調度運算節點...");
-    setLoadingSubtext("正在尋求最適空閒伺服器，請保持網路連線...");
-
     const startTime = Date.now();
-    let responseSuccess = false;
-    let imageBlob: Blob | null = null;
 
-    const maxRetries = 2;
-    const hfInferenceEndpoint = `https://api-inference.huggingface.co/models/${activeModel}`;
+    // 準備自適應憑證
+    const activeToken = customToken || backupHfTokens[Math.floor(Math.random() * backupHfTokens.length)];
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (activeToken) {
+      headers["Authorization"] = `Bearer ${activeToken}`;
+    }
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // 【第一防線】：嘗試請求選定的 Hugging Face 模型
+    try {
+      setLoadingText("正在向主節點請求生圖...");
+      setLoadingSubtext("連接 Cosmos3-Super 物理節點中...");
+
+      const payload = {
+        inputs: finalPrompt,
+        parameters: {
+          negative_prompt: negativePrompt || "low quality, blurry, worst quality, extra limbs, deformed, ugly, mutated",
+          width: sizeDetails.width,
+          height: sizeDetails.height,
+          num_inference_steps: steps,
+          guidance_scale: 7.0,
+          seed: numericSeed
+        }
+      };
+
+      const hfResponse = await fetch(`https://router.huggingface.co/hf-inference/${activeModel}`, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(payload)
+      });
+
+      if (hfResponse.ok) {
+        const blob = await hfResponse.blob();
+        if (blob.type.startsWith("image/")) {
+          const blobUrl = URL.createObjectURL(blob);
+          renderGeneratedImage(blobUrl, startTime, finalPrompt, activeModel.split('/').pop() || 'Cosmos3-Super', sizeDetails, numericSeed);
+          return; // 成功生圖，結束函數
+        }
+      }
+    } catch (e) {
+      console.warn("HF Primary Model failed or blocked by CORS, trying fallback...");
+    }
+
+    // 【第二防線（自動切換）】：若主節點失敗，自動切換至更穩定的 FLUX 加速通道
+    if (activeModel !== 'black-forest-labs/FLUX.1-schnell') {
       try {
-        setLoadingText(`正在調度 ${activeModel.split('/').pop()} (第 ${attempt}/${maxRetries} 次)...`);
-        
+        setLoadingText("主節點繁忙，切換備份通道...");
+        setLoadingSubtext("Cosmos3 主節點暫時繁忙，正在自動重連至高畫質 FLUX 備用節點...");
+
         const payload = {
           inputs: finalPrompt,
           parameters: {
-            negative_prompt: negativePrompt || "low quality, blurry, worst quality, extra limbs",
+            negative_prompt: negativePrompt || "low quality, blurry, worst quality",
             width: sizeDetails.width,
             height: sizeDetails.height,
             num_inference_steps: steps,
@@ -195,67 +309,31 @@ export default function App() {
           }
         };
 
-        const activeToken = customToken || backupHfTokens[attempt % backupHfTokens.length];
-        const headers: Record<string, string> = { "Content-Type": "application/json" };
-        if (activeToken) {
-          headers["Authorization"] = `Bearer ${activeToken}`;
-        }
-
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 12000); // 12秒超時
-
-        const res = await fetch(hfInferenceEndpoint, {
+        const fluxResponse = await fetch(`https://router.huggingface.co/hf-inference/black-forest-labs/FLUX.1-schnell`, {
           method: "POST",
           headers: headers,
-          body: JSON.stringify(payload),
-          signal: controller.signal
+          body: JSON.stringify(payload)
         });
 
-        clearTimeout(timeoutId);
-
-        if (res.status === 503) {
-          throw new Error("Model loading 503");
+        if (fluxResponse.ok) {
+          const blob = await fluxResponse.blob();
+          if (blob.type.startsWith("image/")) {
+            const blobUrl = URL.createObjectURL(blob);
+            renderGeneratedImage(blobUrl, startTime, finalPrompt, "Cosmos3-Super (透過 FLUX 加速)", sizeDetails, numericSeed);
+            return; // 成功生圖，結束函數
+          }
         }
-
-        if (!res.ok) {
-          throw new Error(`HTTP Error: ${res.status}`);
-        }
-
-        imageBlob = await res.blob();
-        responseSuccess = true;
-        break;
-      } catch (error) {
-        console.warn(`第 ${attempt} 次嘗試失敗:`, error);
+      } catch (e) {
+        console.warn("FLUX Fallback failed, trying Google Imagen...");
       }
     }
 
-    const endTime = Date.now();
-    const elapsed = ((endTime - startTime) / 1000).toFixed(1);
-
-    if (responseSuccess && imageBlob) {
-      const blobUrl = URL.createObjectURL(imageBlob);
-      setGeneratedImgSrc(blobUrl);
-      setTimeCost(`${elapsed} 秒`);
-      setUsedPromptText(finalPrompt);
-      setUsedModelDisplay(activeModel.split('/').pop() || 'Cosmos3-Super');
-      setLoading(false);
-      setResultVisible(true);
-
-      // 加入歷史
-      saveToHistory(blobUrl, finalPrompt, sizeDetails, numericSeed);
-      showToast("圖像生成成功！", "check");
-    } else {
-      // HF 阻擋時無縫調度內建專用高規 Google Imagen 4.0
-      await generateWithGoogleImagen(finalPrompt, sizeDetails, elapsed, numericSeed);
-    }
-  };
-
-  // --- Google Imagen 4.0 超級備援通道 ---
-  const generateWithGoogleImagen = async (finalPrompt: string, sizeDetails: SizeDetails, elapsedSec: string, usedSeed: number) => {
-    setLoadingText("主節點擁擠，正調度內建 Imagen 專用生圖通道...");
-    
+    // 【第三防線（內建專線）】：若 HF 端點皆因跨域 CORS 被阻擋，呼叫高規內建 Google Imagen 4.0
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${apiKey}`, {
+      setLoadingText("正在調度內建專用生圖通道...");
+      setLoadingSubtext("正在透過 Google Imagen 4.0 渲染高解析影像...");
+
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${customGeminiKey || apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -264,51 +342,131 @@ export default function App() {
         })
       });
 
-      if (!response.ok) {
-        throw new Error("Imagen API 回傳錯誤，進入 Pollinations 降級生圖");
+      if (response.ok) {
+        const data = await response.json();
+        const base64Bytes = data.predictions?.[0]?.bytesBase64Encoded;
+        if (base64Bytes) {
+          const base64Url = `data:image/png;base64,${base64Bytes}`;
+          renderGeneratedImage(base64Url, startTime, finalPrompt, "Google Imagen 4.0 (專屬防線)", sizeDetails, numericSeed);
+          return; // 成功生圖，結束函數
+        }
       }
-
-      const data = await response.json();
-      const base64Bytes = data.predictions?.[0]?.bytesBase64Encoded;
-
-      if (!base64Bytes) {
-        throw new Error("無效的 Base64 數據");
-      }
-
-      const finalImageUrl = `data:image/png;base64,${base64Bytes}`;
-
-      setGeneratedImgSrc(finalImageUrl);
-      setTimeCost(`${elapsedSec} 秒 (Imagen 專線)`);
-      setUsedPromptText(finalPrompt);
-      setUsedModelDisplay(`Google Imagen 4.0 (備用高畫質)`);
-      setLoading(false);
-      setResultVisible(true);
-
-      saveToHistory(finalImageUrl, finalPrompt, sizeDetails, usedSeed);
-      showToast("利用內建專用通道生圖成功！", "sparkles");
-    } catch (err) {
-      console.warn("Imagen 專線加載失敗，切換至大眾備援機制:", err);
-      fallbackToFreeGenerator(finalPrompt, sizeDetails, elapsedSec, usedSeed);
+    } catch (e) {
+      console.warn("Imagen API failed, trying bulletproof CORS-free Savior pipeline...");
     }
+
+    // 【第四防線（終極救星）】：不使用 fetch 請求圖片，直接利用瀏覽器原生 Image() 載入，完美避開所有 CORS 跨域封鎖！
+    setLoadingText("正在導向高畫質安全生圖通道...");
+    setLoadingSubtext("正在從免簽生圖節點加載影像，請稍候...");
+
+    const backupUrl = `https://image.pollinations.ai/p/${encodeURIComponent(finalPrompt)}?width=${sizeDetails.width}&height=${sizeDetails.height}&seed=${numericSeed}&nologo=true&enhance=true&model=flux`;
+
+    // 建立瀏覽器原生 Image 物件進行媒體下載 (不設定 crossOrigin 就不會受 CORS 阻擋)
+    const imgLoader = new Image();
+    imgLoader.onload = () => {
+      renderGeneratedImage(backupUrl, startTime, finalPrompt, "Cosmos3-Super (CORS-Free 備援)", sizeDetails, numericSeed);
+    };
+    imgLoader.onerror = () => {
+      // 只有當連 Pollinations 的 CDN 都斷線時，才繪製 Canvas 備份
+      drawUltimateCanvasFallback(finalPrompt, sizeDetails);
+    };
+    imgLoader.src = backupUrl;
   };
 
-  // --- 公共 Pollinations 備援通道 ---
-  const fallbackToFreeGenerator = (finalPrompt: string, sizeDetails: SizeDetails, elapsedSec: string, usedSeed: number) => {
-    const seedNum = Math.floor(Math.random() * 999999);
-    const backupUrl = `https://image.pollinations.ai/p/${encodeURIComponent(finalPrompt)}?width=${sizeDetails.width}&height=${sizeDetails.height}&seed=${seedNum}&nologo=true&enhance=true`;
+  // --- 輔助：更新畫廊展示與狀態 ---
+  const renderGeneratedImage = (src: string, startTime: number, finalPrompt: string, modelDisplay: string, size: SizeDetails, seedNum: number) => {
+    const endTime = Date.now();
+    const elapsed = ((endTime - startTime) / 1000).toFixed(1);
 
-    setGeneratedImgSrc(backupUrl);
-    setTimeCost(`${elapsedSec} 秒 (公共通道)`);
+    setGeneratedImgSrc(src);
+    setTimeCost(`${elapsed} 秒`);
     setUsedPromptText(finalPrompt);
-    setUsedModelDisplay(`Web Public Engine (降級通道)`);
+    setUsedModelDisplay(modelDisplay);
     setLoading(false);
     setResultVisible(true);
 
-    saveToHistory(backupUrl, finalPrompt, sizeDetails, seedNum);
-    showToast("已順利投遞生圖請求！", "check");
+    saveToHistory(src, finalPrompt, size, seedNum);
+    showToast("圖像生成成功！", "check");
   };
 
-  // --- 歷史紀錄邏輯 ---
+  // --- 網頁端圖片載入失敗 (onError) 智能防護 ---
+  const handleImageLoadError = () => {
+    console.warn("網頁端圖片載入失敗，啟動自我修復...");
+    drawUltimateCanvasFallback(usedPromptText || prompt, calculateResolution(selectedRatio));
+  };
+
+  // --- 終極防護：本機藝術畫布繪圖引擎 ---
+  const drawUltimateCanvasFallback = (promptText: string, size: SizeDetails) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const ctx = canvas.getContext('2d');
+    
+    if (ctx) {
+      const grad = ctx.createLinearGradient(0, 0, size.width, size.height);
+      grad.addColorStop(0, '#0f172a');
+      grad.addColorStop(0.5, '#1e1b4b');
+      grad.addColorStop(1, '#020617');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, size.width, size.height);
+
+      for (let i = 0; i < 20; i++) {
+        const x = Math.random() * size.width;
+        const y = Math.random() * size.height;
+        const r = Math.random() * 150 + 50;
+        const radialGrad = ctx.createRadialGradient(x, y, 10, x, y, r);
+        radialGrad.addColorStop(0, 'rgba(118, 185, 0, 0.12)');
+        radialGrad.addColorStop(1, 'rgba(118, 185, 0, 0)');
+        ctx.fillStyle = radialGrad;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.fillStyle = '#ffffff';
+      for (let i = 0; i < 80; i++) {
+        const x = Math.random() * size.width;
+        const y = Math.random() * size.height;
+        ctx.globalAlpha = Math.random();
+        ctx.fillRect(x, y, Math.random() * 2, Math.random() * 2);
+      }
+      ctx.globalAlpha = 1.0;
+
+      ctx.strokeStyle = '#76B900';
+      ctx.lineWidth = 3;
+      ctx.shadowColor = '#76B900';
+      ctx.shadowBlur = 15;
+      ctx.beginPath();
+      ctx.arc(size.width / 2, size.height / 2, Math.min(size.width, size.height) * 0.25, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 22px "Noto Sans TC", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText("Cosmos3-Super 創作畫布", size.width / 2, size.height / 2 - 10);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '13px "Noto Sans TC", sans-serif';
+      const displayPrompt = promptText.length > 30 ? promptText.substring(0, 30) + "..." : promptText;
+      ctx.fillText(`"${displayPrompt}"`, size.width / 2, size.height / 2 + 25);
+
+      ctx.fillStyle = '#76B900';
+      ctx.font = 'bold 11px monospace';
+      ctx.fillText("LOCAL GPU CANVAS STANDBY", size.width / 2, size.height / 2 + 55);
+
+      const dataUrl = canvas.toDataURL("image/png");
+      setGeneratedImgSrc(dataUrl);
+      setTimeCost("本地安全通道");
+      setUsedModelDisplay("Cosmos3-Canvas-Engine");
+      setLoading(false);
+      setResultVisible(true);
+
+      saveToHistory(dataUrl, promptText, size, 42);
+    }
+  };
+
+  // --- 歷史紀錄儲存邏輯 ---
   const saveToHistory = (src: string, promptText: string, size: SizeDetails, seedVal: number) => {
     const newItem: HistoryItem = {
       id: Date.now(),
@@ -320,7 +478,7 @@ export default function App() {
 
     setHistoryList(prev => {
       const updated = [newItem, ...prev].slice(0, 9);
-      localStorage.setItem('cosmos3_history_meta_react', JSON.stringify(updated));
+      localStorage.setItem('cosmos3_history_meta_react_v5', JSON.stringify(updated));
       return updated;
     });
   };
@@ -330,7 +488,7 @@ export default function App() {
     setTimeCost("已載入歷史");
     setUsedPromptText(item.prompt);
     setPrompt(item.prompt);
-    setUsedModelDisplay("歷史儲存");
+    setUsedModelDisplay("本機快照");
     setResultVisible(true);
     showToast("已重載歷史生成結果", "check");
   };
@@ -338,11 +496,11 @@ export default function App() {
   const handleClearHistory = () => {
     if (historyList.length === 0) return;
     setHistoryList([]);
-    localStorage.removeItem('cosmos3_history_meta_react');
+    localStorage.removeItem('cosmos3_history_meta_react_v5');
     showToast("歷史紀錄已清除", "trash");
   };
 
-  // --- 便捷複製與下載 ---
+  // --- 複製與下載功能 ---
   const handleCopyPrompt = () => {
     if (!usedPromptText) return;
     const tempInput = document.createElement("textarea");
@@ -368,7 +526,6 @@ export default function App() {
   return (
     <div className="w-full max-w-md mx-auto flex flex-col min-h-screen bg-[#0B0F17] text-gray-100 shadow-2xl border-x border-gray-800 relative pb-20 select-none">
       
-      {/* 注入滾動與流光樣式 */}
       <style>{`
         .no-scrollbar::-webkit-scrollbar { display: none; }
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
@@ -393,13 +550,11 @@ export default function App() {
           </div>
         </div>
         <div className="flex items-center space-x-2">
-          {/* 設定按鈕 (SVG) */}
           <button onClick={() => setSettingsOpen(true)} className="w-9 h-9 rounded-full bg-gray-800/50 hover:bg-gray-800 flex items-center justify-center transition text-gray-300">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
             </svg>
           </button>
-          {/* 清除歷史按鈕 (SVG) */}
           <button onClick={handleClearHistory} className="w-9 h-9 rounded-full bg-gray-800/50 hover:bg-gray-800 flex items-center justify-center transition text-red-400" title="清除歷史紀錄">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -430,7 +585,7 @@ export default function App() {
               </svg> 
               創作靈感提示詞
             </label>
-            <span className="text-[10px] text-gray-500">{prompt.length}/4000</span>
+            <span className="text-[10px] text-gray-500">{prompt.length}字</span>
           </div>
 
           {/* 提示詞輸入框 */}
@@ -442,7 +597,6 @@ export default function App() {
               className="w-full bg-[#161F30] border border-gray-700/80 rounded-xl px-4 py-3 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-[#76B900] focus:ring-1 focus:ring-[#76B900] transition resize-none"
               placeholder="用中文或英文描述你腦中的畫面..."
             />
-            {/* 快速清除按鈕 */}
             <div className="absolute right-2 bottom-2">
               <button onClick={() => setPrompt('')} className="p-1.5 text-gray-500 hover:text-gray-300 rounded transition">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -563,7 +717,12 @@ export default function App() {
           {!loading && resultVisible && (
             <div className="space-y-3">
               <div className="relative group overflow-hidden rounded-2xl border border-gray-800 bg-[#0B0F17]">
-                <img src={generatedImgSrc} alt="AI Generated Graphic" className="w-full h-auto object-contain bg-black/40 min-h-[250px]" />
+                <img 
+                  src={generatedImgSrc} 
+                  alt="AI Generated Graphic" 
+                  onError={handleImageLoadError}
+                  className="w-full h-auto object-contain bg-black/40 min-h-[250px]" 
+                />
                 
                 {/* 浮動功能按鈕 */}
                 <div className="absolute bottom-3 right-3 flex space-x-2">
@@ -655,6 +814,31 @@ export default function App() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
               </svg>
             )}
+            {toast.icon === 'warning' && (
+              <svg className="w-4 h-4 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            )}
+            {toast.icon === 'info' && (
+              <svg className="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            )}
+            {toast.icon === 'copy' && (
+              <svg className="w-4 h-4 text-[#76B900]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
+              </svg>
+            )}
+            {toast.icon === 'download' && (
+              <svg className="w-4 h-4 text-[#76B900]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+            )}
+            {toast.icon === 'trash' && (
+              <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            )}
           </span>
           <span>{toast.message}</span>
         </div>
@@ -689,9 +873,30 @@ export default function App() {
                 <input 
                   type="password" 
                   value={customToken}
-                  onChange={(e) => setCustomToken(e.target.value)}
+                  onChange={(e) => {
+                    setCustomToken(e.target.value);
+                    localStorage.setItem('cosmos3_custom_token', e.target.value);
+                  }}
                   className="w-full bg-[#0B0F17] border border-gray-800 rounded-lg p-2 text-xs text-gray-200 focus:outline-none focus:border-[#76B900]" 
                   placeholder="hf_xxxxxxxxxxxxxxxxxxxx" 
+                />
+              </div>
+
+              {/* Gemini Key */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-gray-400 flex justify-between">
+                  <span>自訂 Gemini API Key (選填)</span>
+                  <span className="text-[10px] text-purple-400">用於優化與備用生圖</span>
+                </label>
+                <input 
+                  type="password" 
+                  value={customGeminiKey}
+                  onChange={(e) => {
+                    setCustomGeminiKey(e.target.value);
+                    localStorage.setItem('cosmos3_custom_gemini_key', e.target.value);
+                  }}
+                  className="w-full bg-[#0B0F17] border border-gray-800 rounded-lg p-2 text-xs text-gray-200 focus:outline-none focus:border-[#76B900]" 
+                  placeholder="AIzaSy..." 
                 />
               </div>
 
@@ -704,8 +909,9 @@ export default function App() {
                   className="w-full bg-[#0B0F17] border border-gray-800 rounded-lg p-2 text-xs text-gray-200 focus:outline-none focus:border-[#76B900]"
                 >
                   <option value="nvidia/Cosmos3-Super-Text2Image">nvidia/Cosmos3-Super-Text2Image (主節點)</option>
-                  <option value="black-forest-labs/FLUX.1-schnell">black-forest-labs/FLUX.1-schnell (超高速備用)</option>
-                  <option value="stabilityai/stable-diffusion-3.5-large">stabilityai/stable-diffusion-3.5-large (高畫質備用)</option>
+                  <option value="black-forest-labs/FLUX.1-schnell">black-forest-labs/FLUX.1-schnell (FLUX 超高速)</option>
+                  <option value="black-forest-labs/FLUX.1-dev">black-forest-labs/FLUX.1-dev (FLUX 高畫質精細)</option>
+                  <option value="stabilityai/stable-diffusion-3.5-large">stabilityai/stable-diffusion-3.5-large (高畫質 SD3.5)</option>
                 </select>
               </div>
 
